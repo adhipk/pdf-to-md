@@ -1,0 +1,19 @@
+{
+  "name": "pdf-to-md",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "extract": "bun run index.ts",
+    "dev": "bunx live-server --open=index.html"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "live-server": "^1.2.2"
+  }
+}
