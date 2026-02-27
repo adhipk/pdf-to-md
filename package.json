@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "extract": "bun run index.ts",
-    "dev": "bunx live-server --open=index.html"
+    "dev": "bunx live-server --open=index.html",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"

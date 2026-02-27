@@ -1,4 +1,6 @@
-import { basename } from "node:path";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
 
 type ExtractVersion = {
   id: string;
@@ -10,6 +12,15 @@ type VersionPayload = {
   id: string;
   label: string;
   args: string[];
+  pages: string[];
+  stats: {
+    pages: number;
+    lines: number;
+    chars: number;
+  };
+};
+
+type SemanticPayload = {
   pages: string[];
   stats: {
     pages: number;
@@ -61,6 +72,177 @@ function buildPayload(version: ExtractVersion, text: string): VersionPayload {
       chars: normalized.length,
     },
   };
+}
+
+function decodeXmlEntities(text: string): string {
+  return text
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'");
+}
+
+function attrsToMap(attrText: string): Map<string, string> {
+  const map = new Map<string, string>();
+  const re = /(\w+)="([^"]*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(attrText)) !== null) {
+    map.set(m[1], m[2]);
+  }
+  return map;
+}
+
+function buildSemanticFromXml(xml: string): SemanticPayload {
+  type XmlLine = {
+    col: number;
+    top: number;
+    left: number;
+    fontSize: number;
+    bold: boolean;
+    text: string;
+  };
+
+  const pages: string[] = [];
+  let totalLines = 0;
+  let totalChars = 0;
+
+  const pageRe = /<page\b([^>]*)>([\s\S]*?)<\/page>/g;
+  let pageMatch: RegExpExecArray | null;
+
+  while ((pageMatch = pageRe.exec(xml)) !== null) {
+    const pageAttrs = attrsToMap(pageMatch[1]);
+    const pageBody = pageMatch[2];
+    const pageHeight = Number(pageAttrs.get("height") ?? "0");
+    const pageWidth = Number(pageAttrs.get("width") ?? "0");
+
+    const fontSizes = new Map<string, number>();
+    const fontRe = /<fontspec\b([^>]*)\/>/g;
+    let fontMatch: RegExpExecArray | null;
+    while ((fontMatch = fontRe.exec(pageBody)) !== null) {
+      const attrs = attrsToMap(fontMatch[1]);
+      const id = attrs.get("id");
+      const size = Number(attrs.get("size") ?? "0");
+      if (id) fontSizes.set(id, size);
+    }
+
+    type Item = {
+      top: number;
+      left: number;
+      fontSize: number;
+      bold: boolean;
+      text: string;
+    };
+    const items: Item[] = [];
+    const textRe = /<text\b([^>]*)>([\s\S]*?)<\/text>/g;
+    let textMatch: RegExpExecArray | null;
+    while ((textMatch = textRe.exec(pageBody)) !== null) {
+      const attrs = attrsToMap(textMatch[1]);
+      const top = Number(attrs.get("top") ?? "0");
+      const left = Number(attrs.get("left") ?? "0");
+      const fontId = attrs.get("font") ?? "";
+      const fontSize = fontSizes.get(fontId) ?? 12;
+      const bold = /<b>/.test(textMatch[2]);
+      const text = decodeXmlEntities(textMatch[2].replace(/<[^>]+>/g, ""))
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!text) continue;
+      if (pageHeight > 0 && (top < 80 || top > pageHeight - 80)) continue;
+      if (/^PDF\s+\d/.test(text)) continue;
+      if (/^©\s+Adobe Systems/.test(text)) continue;
+      if (/^(Page\s+)?\d+$/.test(text)) continue;
+      if (/^THIS PAGE BLANK$/i.test(text)) continue;
+
+      items.push({ top, left, fontSize, bold, text });
+    }
+
+    const mid = pageWidth > 0 ? pageWidth / 2 : 0;
+    const leftCount = items.filter((i) => i.left < mid - 40).length;
+    const rightCount = items.filter((i) => i.left > mid + 40).length;
+    const twoCol = pageWidth > 0 && leftCount > 25 && rightCount > 25;
+
+    const sorted = items
+      .map((i) => ({
+        ...i,
+        col: twoCol && i.left > mid ? 1 : 0,
+      }))
+      .sort((a, b) => a.col - b.col || a.top - b.top || a.left - b.left);
+
+    const lines: XmlLine[] = [];
+    for (const item of sorted) {
+      const prev = lines[lines.length - 1];
+      if (
+        prev &&
+        prev.col === item.col &&
+        Math.abs(prev.top - item.top) <= 3 &&
+        Math.abs(prev.left - item.left) < 500
+      ) {
+        prev.text += ` ${item.text}`;
+        prev.fontSize = Math.max(prev.fontSize, item.fontSize);
+        prev.bold = prev.bold || item.bold;
+        continue;
+      }
+      lines.push({
+        col: item.col,
+        top: item.top,
+        left: item.left,
+        fontSize: item.fontSize,
+        bold: item.bold,
+        text: item.text,
+      });
+    }
+
+    const out: string[] = [];
+    let prevTop = -1;
+    let prevCol = -1;
+    for (const line of lines) {
+      const lineText = line.text.replace(/\s+/g, " ").trim();
+      if (!lineText) continue;
+      if (prevTop !== -1) {
+        if (line.col !== prevCol) out.push("");
+        if (line.top - prevTop > Math.max(14, line.fontSize * 1.45)) out.push("");
+      }
+      out.push(lineText);
+      prevTop = line.top;
+      prevCol = line.col;
+    }
+
+    const pageText = out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+    pages.push(pageText);
+    totalLines += pageText ? pageText.split("\n").length : 0;
+    totalChars += pageText.length;
+  }
+
+  return {
+    pages,
+    stats: {
+      pages: pages.length,
+      lines: totalLines,
+      chars: totalChars,
+    },
+  };
+}
+
+function extractSemanticStructured(inputPdfPath: string): SemanticPayload {
+  const tmpBase = mkdtempSync(join(tmpdir(), "pdf-to-md-sem-"));
+  const outXml = join(tmpBase, "structured.xml");
+
+  try {
+    const run = Bun.spawnSync({
+      cmd: ["pdftohtml", "-xml", "-i", "-nodrm", "-q", inputPdfPath, outXml],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (run.exitCode !== 0) {
+      const stderr = new TextDecoder().decode(run.stderr).trim();
+      throw new Error(stderr || "pdftohtml failed");
+    }
+    const xml = readFileSync(outXml, "utf8");
+    return buildSemanticFromXml(xml);
+  } finally {
+    rmSync(tmpBase, { recursive: true, force: true });
+  }
 }
 
 const rawArgs = Bun.argv.slice(2);
@@ -122,7 +304,22 @@ for (const version of versions) {
   }
 }
 
-const payloadBase64 = Buffer.from(JSON.stringify(payloads), "utf8").toString(
+let semantic: SemanticPayload;
+try {
+  semantic = extractSemanticStructured(inputPdf);
+} catch (error) {
+  const message =
+    error instanceof Error ? error.message : "Unknown semantic extraction failure";
+  console.error(`Failed to extract structured semantic content: ${message}`);
+  process.exit(1);
+}
+
+const dashboardPayload = {
+  versions: payloads,
+  semantic,
+};
+
+const payloadBase64 = Buffer.from(JSON.stringify(dashboardPayload), "utf8").toString(
   "base64",
 );
 const title = basename(inputPdf);
@@ -133,136 +330,143 @@ const html = `<!doctype html>
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Extraction Comparison: ${safeTitle}</title>
+    <title>PDF Viewer: ${safeTitle}</title>
     <style>
       :root {
-        --bg: #f4f6fb;
-        --text: #111827;
-        --muted: #6b7280;
-        --card: #ffffff;
-        --border: #d1d5db;
-        --accent: #0d9488;
-        --diff: #fff4d6;
+        --bg: #f5f5f5;
+        --fg: #111;
+        --muted: #666;
+        --border: #d8d8d8;
+        --panel: #fff;
+      }
+      * {
+        box-sizing: border-box;
       }
       body {
         margin: 0;
-        padding: 0;
-        font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
-        line-height: 1.45;
         background: var(--bg);
-        color: var(--text);
+        color: var(--fg);
+        font-family: ui-sans-serif, -apple-system, "Segoe UI", sans-serif;
       }
-      .topbar {
+      .toolbar {
         position: sticky;
         top: 0;
-        z-index: 10;
-        display: grid;
-        grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) minmax(280px, 2fr);
+        z-index: 20;
+        display: flex;
         gap: 8px;
         align-items: center;
-        padding: 6px 10px;
+        padding: 8px;
         border-bottom: 1px solid var(--border);
-        background: #ffffffee;
-        backdrop-filter: blur(6px);
+        background: #fff;
       }
-      .topbar-title {
-        display: flex;
-        align-items: baseline;
-        gap: 8px;
+      .file {
         min-width: 0;
-      }
-      .topbar-title h1 {
-        margin: 0;
-        font-size: 14px;
-        white-space: nowrap;
-      }
-      .topbar-title span {
-        color: var(--muted);
-        font-size: 12px;
-        white-space: nowrap;
+        max-width: 32vw;
         overflow: hidden;
         text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        color: var(--muted);
       }
-      .topbar-field {
-        min-width: 0;
+      .spacer {
+        flex: 1;
       }
-      .topbar-field label {
-        display: none;
-      }
-      .pages {
+      .group {
         display: flex;
-        flex-direction: column;
         gap: 6px;
-        padding: 6px;
+        align-items: center;
       }
-      .page-row {
+      button {
+        border: 1px solid var(--border);
+        background: #fff;
+        color: var(--fg);
+        border-radius: 4px;
+        padding: 4px 9px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button.active {
+        background: #111;
+        color: #fff;
+        border-color: #111;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      input[type="number"] {
+        width: 68px;
         border: 1px solid var(--border);
         border-radius: 4px;
-        background: #fff;
-        overflow: hidden;
+        padding: 4px 6px;
+        font-size: 13px;
       }
-      .page-row-head {
-        padding: 4px 8px;
-        font-weight: 600;
-        border-bottom: 1px solid var(--border);
-        background: #f7f7f7;
+      .meta {
+        padding: 5px 10px;
         font-size: 12px;
         color: var(--muted);
       }
-      .page-row-body {
+      .viewer {
+        height: calc(100vh - 76px);
+        overflow: auto;
+        padding: 8px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+      }
+      .panel-head {
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .two-col {
         display: grid;
         grid-template-columns: 1fr 1fr;
-        gap: 0;
       }
-      .page-col {
-        padding: 6px;
-      }
-      .page-col + .page-col {
+      .col + .col {
         border-left: 1px solid var(--border);
       }
-      .page-col-title {
-        margin: 0 0 4px;
-        color: var(--muted);
-        font-size: 11px;
-        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-      }
-      .page-text {
+      .content {
         margin: 0;
+        padding: 10px;
         white-space: pre-wrap;
         word-break: break-word;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 13px;
         line-height: 1.35;
       }
-      select, input {
-        width: 100%;
-        margin: 0;
-        padding: 4px 6px;
-        border-radius: 4px;
-        border: 1px solid var(--border);
-        font: inherit;
+      .semantic {
+        padding: 10px;
       }
-      .stats {
-        color: var(--muted);
-        font-size: 12px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+      .semantic h3 {
+        margin: 0 0 8px;
+        font-size: 18px;
       }
-      .loading {
-        color: var(--muted);
-        font-size: 12px;
-        margin: 4px 8px;
+      .semantic h4 {
+        margin: 10px 0 6px;
+        font-size: 15px;
       }
-      @media (max-width: 960px) {
-        .topbar {
-          grid-template-columns: 1fr;
-          position: static;
+      .semantic p,
+      .semantic li {
+        margin: 0 0 7px;
+        line-height: 1.5;
+      }
+      @media (max-width: 900px) {
+        .toolbar {
+          flex-wrap: wrap;
         }
-        .page-row-body {
+        .file {
+          max-width: 100%;
+          width: 100%;
+          order: 3;
+        }
+        .two-col {
           grid-template-columns: 1fr;
         }
-        .page-col + .page-col {
+        .col + .col {
           border-left: 0;
           border-top: 1px solid var(--border);
         }
@@ -270,140 +474,172 @@ const html = `<!doctype html>
     </style>
   </head>
   <body>
-    <div class="topbar">
-      <div class="topbar-title">
-        <h1>PDF Compare</h1>
-        <span>${safeTitle}</span>
+    <div class="toolbar">
+      <div class="group" id="modeButtons">
+        <button data-mode="compare" class="active">Compare</button>
+        <button data-mode="semantic">Semantic</button>
+        <button data-mode="true">Layout</button>
       </div>
-      <div class="topbar-field">
-        <label for="leftVersion">Left Version</label>
-        <select id="leftVersion"></select>
+      <div class="group">
+        <button id="prevBtn">Prev</button>
+        <input id="pageInput" type="number" min="1" value="1" />
+        <span id="pageCount" style="font-size:12px;color:#666;">/ 1</span>
+        <button id="nextBtn">Next</button>
       </div>
-      <div class="topbar-field">
-        <label for="rightVersion">Right Version</label>
-        <select id="rightVersion"></select>
-      </div>
+      <div class="spacer"></div>
+      <div class="file">${safeTitle}</div>
     </div>
-
-    <div class="loading" id="loading">Rendering pages...</div>
-    <div class="stats" id="stats" style="padding: 0 8px 6px;"></div>
-    <div id="pages" class="pages"></div>
-
-    <template id="pageTemplate">
-      <article class="page-row">
-        <header class="page-row-head"></header>
-        <div class="page-row-body">
-          <section class="page-col">
-            <h3 class="page-col-title"></h3>
-            <pre class="page-text"></pre>
-          </section>
-          <section class="page-col">
-            <h3 class="page-col-title"></h3>
-            <pre class="page-text"></pre>
-          </section>
-        </div>
-      </article>
-    </template>
-
-    <div class="loading" id="done" style="display:none;">
-      Done rendering all pages.
-    </div>
+    <div class="meta" id="meta"></div>
+    <main class="viewer" id="viewer"></main>
 
     <script>
       const payloadBase64 = "${payloadBase64}";
-      const payloadBytes = Uint8Array.from(atob(payloadBase64), (c) =>
-        c.charCodeAt(0),
-      );
-      const versions = JSON.parse(new TextDecoder().decode(payloadBytes));
-      const leftSelect = document.getElementById("leftVersion");
-      const rightSelect = document.getElementById("rightVersion");
-      const stats = document.getElementById("stats");
-      const pagesRoot = document.getElementById("pages");
-      const loading = document.getElementById("loading");
-      const done = document.getElementById("done");
-      const pageTemplate = document.getElementById("pageTemplate");
+      const bytes = Uint8Array.from(atob(payloadBase64), (c) => c.charCodeAt(0));
+      const payload = JSON.parse(new TextDecoder().decode(bytes));
+      const versions = payload.versions || [];
+      const semantic = payload.semantic || { pages: [], stats: { pages: 0, lines: 0, chars: 0 } };
 
-      function esc(s) {
-        return s
-          .replaceAll("&", "&amp;")
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;");
+      const modeButtons = document.getElementById("modeButtons");
+      const pageInput = document.getElementById("pageInput");
+      const pageCount = document.getElementById("pageCount");
+      const prevBtn = document.getElementById("prevBtn");
+      const nextBtn = document.getElementById("nextBtn");
+      const meta = document.getElementById("meta");
+      const viewer = document.getElementById("viewer");
+
+      const defaultVer = versions.find((v) => v.id === "default") || versions[0];
+      const layoutVer = versions.find((v) => v.id === "layout") || versions[0];
+      const rawVer = versions.find((v) => v.id === "raw") || versions[0];
+
+      let mode = "compare";
+      let page = 1;
+
+      function maxPages() {
+        if (mode === "semantic") return Math.max(1, semantic.pages.length || 1);
+        if (mode === "true") return Math.max(1, layoutVer?.pages?.length || 1);
+        return Math.max(
+          1,
+          defaultVer?.pages?.length || 1,
+          layoutVer?.pages?.length || 1,
+        );
       }
 
-      function byId(id) {
-        return versions.find((v) => v.id === id);
+      function safePageText(ver, n) {
+        if (!ver || !Array.isArray(ver.pages)) return "";
+        return ver.pages[n - 1] || "";
       }
 
-      function setOptions(select, selected) {
-        select.innerHTML = versions
-          .map((v) => "<option value='" + v.id + "'>" + v.label + "</option>")
-          .join("");
-        select.value = selected;
+      function clearActiveMode() {
+        modeButtons.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
       }
 
-      function renderPageRow(pageNumber, left, right) {
-        const node = pageTemplate.content.firstElementChild.cloneNode(true);
-        const head = node.querySelector(".page-row-head");
-        const leftTitle = node.querySelectorAll(".page-col-title")[0];
-        const rightTitle = node.querySelectorAll(".page-col-title")[1];
-        const leftText = node.querySelectorAll(".page-text")[0];
-        const rightText = node.querySelectorAll(".page-text")[1];
+      function semanticHtml(pageText) {
+        const lines = (pageText || "").split("\\n").map((s) => s.trim()).filter(Boolean);
+        const blocks = [];
+        let cur = [];
+        for (const line of lines) {
+          if (!line) continue;
+          if (cur.length && /[.!?;:]$/.test(cur[cur.length - 1])) {
+            blocks.push(cur);
+            cur = [];
+          }
+          cur.push(line);
+        }
+        if (cur.length) blocks.push(cur);
 
-        head.textContent = "Page " + pageNumber;
-        leftTitle.textContent = left.label;
-        rightTitle.textContent = right.label;
-        leftText.textContent = left.pages[pageNumber - 1] || "";
-        rightText.textContent = right.pages[pageNumber - 1] || "";
-
-        return node;
+        const out = [];
+        for (const b of blocks) {
+          const text = b.join(" ").replace(/\\s+/g, " ").trim();
+          if (!text) continue;
+          if (/^\\d+(\\.\\d+)*\\s+/.test(text) || (text.length < 90 && text === text.toUpperCase())) {
+            out.push("<h4>" + text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + "</h4>");
+          } else if (/^([\\-*•]|\\d+[.)]|\\[[0-9]+\\])\\s+/.test(text)) {
+            out.push("<ul><li>" + text.replace(/^([\\-*•]|\\d+[.)]|\\[[0-9]+\\])\\s+/, "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + "</li></ul>");
+          } else {
+            out.push("<p>" + text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + "</p>");
+          }
+        }
+        return out.join("");
       }
 
       function render() {
-        const left = byId(leftSelect.value);
-        const right = byId(rightSelect.value);
-        const maxPage = Math.max(left.stats.pages, right.stats.pages);
+        const max = maxPages();
+        if (page < 1) page = 1;
+        if (page > max) page = max;
+        pageInput.value = String(page);
+        pageInput.max = String(max);
+        pageCount.textContent = "/ " + max;
+        prevBtn.disabled = page <= 1;
+        nextBtn.disabled = page >= max;
 
-        stats.textContent =
-          left.label + ": " + left.stats.pages + " pages, " + left.stats.lines + " lines, " + left.stats.chars + " chars | " +
-          right.label + ": " + right.stats.pages + " pages, " + right.stats.lines + " lines, " + right.stats.chars + " chars | " +
-          "Showing all " + maxPage + " pages";
-
-        pagesRoot.innerHTML = "";
-        done.style.display = "none";
-        loading.style.display = "block";
-
-        let page = 1;
-        const batchSize = 8;
-
-        function renderBatch() {
-          const fragment = document.createDocumentFragment();
-          let count = 0;
-
-          while (page <= maxPage && count < batchSize) {
-            fragment.appendChild(renderPageRow(page, left, right));
-            page += 1;
-            count += 1;
-          }
-
-          pagesRoot.appendChild(fragment);
-
-          if (page <= maxPage) {
-            requestAnimationFrame(renderBatch);
-            return;
-          }
-
-          loading.style.display = "none";
-          done.style.display = "block";
+        if (mode === "compare") {
+          meta.textContent =
+            "Compare page " +
+            page +
+            " | Default vs Layout";
+          viewer.innerHTML =
+            '<section class="panel">' +
+            '<header class="panel-head">Page ' + page + " | Default vs Layout</header>" +
+            '<div class="two-col">' +
+              '<div class="col"><pre class="content">' + (safePageText(defaultVer, page) || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + '</pre></div>' +
+              '<div class="col"><pre class="content">' + (safePageText(layoutVer, page) || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + '</pre></div>' +
+            "</div>" +
+            "</section>";
+          return;
         }
 
-        requestAnimationFrame(renderBatch);
+        if (mode === "semantic") {
+          meta.textContent =
+            "Semantic view page " +
+            page +
+            " | " +
+            semantic.stats.pages +
+            " pages, " +
+            semantic.stats.lines +
+            " lines";
+          viewer.innerHTML =
+            '<section class="panel">' +
+            '<header class="panel-head">Page ' + page + " | Semantic</header>" +
+            '<article class="semantic">' +
+              "<h3>Page " + page + "</h3>" +
+              semanticHtml(semantic.pages[page - 1] || "") +
+            "</article>" +
+            "</section>";
+          return;
+        }
+
+        meta.textContent = "Layout view page " + page + " | Using -layout extraction";
+        viewer.innerHTML =
+          '<section class="panel">' +
+          '<header class="panel-head">Page ' + page + " | Layout</header>" +
+          '<pre class="content">' + (safePageText(layoutVer, page) || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;") + '</pre>' +
+          "</section>";
       }
 
-      setOptions(leftSelect, versions[0]?.id || "");
-      setOptions(rightSelect, versions[1]?.id || versions[0]?.id || "");
+      modeButtons.addEventListener("click", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLButtonElement)) return;
+        const nextMode = target.getAttribute("data-mode");
+        if (!nextMode) return;
+        mode = nextMode;
+        clearActiveMode();
+        target.classList.add("active");
+        page = 1;
+        render();
+      });
 
-      leftSelect.addEventListener("change", render);
-      rightSelect.addEventListener("change", render);
+      prevBtn.addEventListener("click", () => {
+        page -= 1;
+        render();
+      });
+      nextBtn.addEventListener("click", () => {
+        page += 1;
+        render();
+      });
+      pageInput.addEventListener("change", () => {
+        page = Number(pageInput.value || "1");
+        render();
+      });
 
       render();
     </script>
